@@ -1,77 +1,202 @@
 package org.example;
 
 import java.io.IOException;
+import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 public class NodeHandler {
 
-    private static NodeHandler INSTANCE = null;
-    public static NodeHandler getInstance(){
-        if(INSTANCE == null){
-            INSTANCE = new NodeHandler();
-        }
-        return INSTANCE;
-    }
+    private Map<Long, Node> startingQueue;
+    private Map<Long, Node> activeNodes;
+    private Map<Long, Node> closingQueue;
 
-    private int port;
-    private final List<Node> activeNodes;
-    private final int minimumNodeCount;
+    private int portCounter = 8080;
 
     private final ReentrantReadWriteLock lock;
     private boolean alive = true;
 
-    private NodeHandler() {
-        this.port = 8080;
-        this.activeNodes = new ArrayList<>();
-        this.minimumNodeCount = 3;
+    private int minAmountOfNodes;
+    private int runCheckerInterval;
 
+    public NodeHandler(){
+        this.startingQueue = new HashMap<>();
+        this.activeNodes = new HashMap<>();
+        this.closingQueue = new HashMap<>();
         this.lock = new ReentrantReadWriteLock();
-
-        this.start(minimumNodeCount);
+        this.minAmountOfNodes = 3;
+        this.runCheckerInterval = 3;
+        nodeInitializer(minAmountOfNodes);
+        startThread();
     }
 
-    public void start(int amountOfNodes){
-        for(int i = 0; i < amountOfNodes; i++){
-            var node = new Node(port++);
-            activeNodes.add(node);
-
+    private void nodeInitializer(int nrOfNodesToInit){
+        for(int i = 0; i < nrOfNodesToInit; i++){
             try{
-                node.start();
-            }catch (Exception e){
-                e.printStackTrace();
-                i--;
+                initNode(portCounter);
+                portCounter++;
+            } catch (IOException ioe){
+                System.out.printf("Couldn't init a node on port %d\n", portCounter);
+                ioe.printStackTrace();
             }
         }
     }
 
-    public Node next() {
-        if(activeNodes.isEmpty()){
-            return null;
+    private void initNode(int port) throws IOException {
+        try {
+            lock.writeLock().lock();
+            Node node = new Node(port).start();
+            startingQueue.put(node.getNodePId(), node);
+        } finally {
+            lock.writeLock().unlock();
         }
+    }
 
-        Node node = activeNodes.get(0);
-        System.out.println("------------------------------------------");
-        for (Node n:activeNodes) {
-            if(n.getRequests() < node.getRequests()){
-                node = n;
+    public void destroyAllNodes(){
+        for(Long nodeId : startingQueue.keySet()){
+            startingQueue.get(nodeId).stop();
+        }
+        startingQueue.clear();
+        for(Long nodeId : activeNodes.keySet()){
+            activeNodes.get(nodeId).stop();
+        }
+        activeNodes.clear();
+        for(Long nodeId : closingQueue.keySet()){
+            closingQueue.get(nodeId).stop();
+        }
+        closingQueue.clear();
+    }
+
+    public void increaseNodeRequest(long nodeId, String nodeChannelId){
+        try {
+            lock.writeLock().lock();
+            activeNodes.get(nodeId).increaseRequests(nodeChannelId);
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    public Node getNextNode(){
+        try {
+            lock.writeLock().lock();
+            if (activeNodes.isEmpty()) return null;
+
+            Node node = null;
+
+            for (Long nodeId : activeNodes.keySet()) {
+                Node collectedNode = activeNodes.get(nodeId);
+                if (node == null) node = collectedNode;
+                else if (collectedNode.getTotalRequests() < node.getTotalRequests()) {
+                    node = collectedNode;
+                }
             }
-            System.out.println("Node:" + n.getPort() + " | " + n.getRequests());
+            return node;
+        }finally {
+            lock.writeLock().unlock();
         }
-
-        node.setRequests(node.getRequests() + 1);
-        if(node.getRequests() > 3){
-            close(node);
-            start(1);
-            return next();
-        }
-        return node;
     }
 
-    public void close(Node node){
-        node.stop();
-        activeNodes.remove(node);
+    private void checker(){
+        closingQueue.forEach((key, value) -> {
+            if (value.connectionsIsEmpty()){
+                value.stop();
+            }
+        });
+
+        List<Long> nullableNodes = new ArrayList<>();
+        List<Long> movableNodes = new ArrayList<>();
+        startingQueue.forEach((key, value) -> {
+            if (value.getStartInstant() == null){
+                nullableNodes.add(key);
+            }else if(value.getStartInstant().plusSeconds(5).compareTo(Instant.now()) < 0){
+                movableNodes.add(key);
+            }
+        });
+
+        for(Long nodeId : nullableNodes){
+            try {
+                lock.writeLock().lock();
+                startingQueue.get(nodeId).stop();
+                startingQueue.remove(nodeId);
+                System.out.printf("Startup for node %d failed. Sent to destruction.\n", nodeId);
+            } finally {
+                lock.writeLock().unlock();
+            }
+        }
+
+        for(Long nodeId : movableNodes){
+            try {
+                lock.writeLock().lock();
+                activeNodes.put(nodeId, startingQueue.get(nodeId));
+                startingQueue.remove(nodeId);
+                System.out.printf("Startup for node %d is finished. Moved from startingQueue to activeNodes.\n", nodeId);
+            } finally {
+                lock.writeLock().unlock();
+            }
+        }
+
+        var requests = 0.0;
+        var rps = 0.0;
+        requests = activeNodes.entrySet().stream().reduce(0, (subtotal, entry) -> subtotal + entry.getValue().getRequests(), Integer::sum);
+        rps = requests / (double)(activeNodes.size() + startingQueue.size()) / runCheckerInterval;
+
+        if(rps < 1.0 && activeNodes.size() > minAmountOfNodes){
+            System.out.printf("Requests per second is less than 1(%f). Amount of nodes >= %d. Closing a node.\n", rps, minAmountOfNodes);
+            closeFirstNode();
+        }else if(rps > 1.0 || activeNodes.size()+startingQueue.size() < minAmountOfNodes){
+            System.out.printf("Requests per second is greater than 5(%f). Initializing a node.\n", rps);
+            nodeInitializer(1);
+        }
+        activeNodes.forEach((key, value) -> {value.resetRequests();});
     }
 
+    private void closeFirstNode(){
+        var firstNode = activeNodes.entrySet().stream().findFirst().orElse(null);
+
+        if(firstNode != null){
+            try {
+                lock.writeLock().lock();
+                closingQueue.put(firstNode.getKey(), firstNode.getValue());
+                activeNodes.remove(firstNode.getKey());
+                System.out.printf("Node %d is redundant. Sent to destruction by moving from activeNodes to closingQueue.\n", firstNode.getKey());
+            } finally {
+                lock.writeLock().unlock();
+            }
+        }
+    }
+
+    private void startThread() {
+        var thread = new Thread(this::runThread);
+        thread.start();
+    }
+
+    private void runThread() {
+        try {
+            lock.writeLock().lock();
+            if (!alive) {
+                return;
+            }
+            checker();
+        } catch(Exception e) {
+            e.printStackTrace();
+        } finally {
+            lock.writeLock().unlock();
+        }
+
+        try {
+            int millis = runCheckerInterval * 1000;
+            Thread.sleep(millis);
+        } catch(Exception e) {
+            e.printStackTrace();
+        }
+        runThread();
+    }
+
+    public void killCheckerThread(){
+        alive = false;
+        System.out.println("Checker thread is killed");
+    }
 }

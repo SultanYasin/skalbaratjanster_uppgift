@@ -4,27 +4,43 @@ import io.netty.buffer.ByteBuf;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
-import io.netty.handler.codec.http.FullHttpRequest;
-import io.netty.handler.codec.http.FullHttpResponse;
-import io.netty.handler.codec.http.HttpRequest;
 
-//Hanterar kommunikationen mellan proxyn och tjänsterna
 public class ClientHandler extends SimpleChannelInboundHandler<ByteBuf> {
-    private final Channel originalChannel;
 
-    public ClientHandler(Channel channel) {
-        this.originalChannel = channel;
+    private final Channel clientChannel;
+    private final Node node;
+
+    public ClientHandler(Channel clientChannel, Node node) {
+        this.clientChannel = clientChannel;
+        this.node = node;
     }
 
     @Override
-    protected void channelRead0(ChannelHandlerContext channelHandlerContext, ByteBuf byteBuf) throws Exception {
-        originalChannel.writeAndFlush(byteBuf.copy()); //Vi behöver kopiera och skicka nya objekt då Netty raderar objekt osv.
-        channelHandlerContext.channel().close();
+    public void channelActive(ChannelHandlerContext ctx){
+        System.out.printf("Server connected to node(%d) %s | ConnectionID: %s\n", node.getNodePId() ,ctx.channel().remoteAddress(), ctx.channel().id());
+    }
+
+    @Override
+    protected void channelRead0(ChannelHandlerContext ctx, ByteBuf byteBuf) throws Exception {
+        System.out.printf("Server received message from node(%d) | ConnectionID: %s\n",node.getNodePId(), ctx.channel().id());
+        clientChannel.writeAndFlush(byteBuf.copy());
+        System.out.printf("Server forwards message to client | ConnectionID: %s\n", clientChannel.id());
+        ctx.channel().close();
+    }
+
+    @Override
+    public void channelInactive(ChannelHandlerContext ctx) throws Exception {
+        System.out.printf("Connection to node(%d) inactive | ConnectionID: %s\n", node.getNodePId(), ctx.channel().id());
+        node.removeConnection(ctx.channel().id().toString());
+        clientChannel.close();
     }
 
     @Override
     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
+        System.out.printf("Error in %s, ClientHandler\n", ctx.channel().id());
+        cause.printStackTrace();
         ctx.channel().close();
-        originalChannel.close();
+        clientChannel.close();
     }
+
 }
