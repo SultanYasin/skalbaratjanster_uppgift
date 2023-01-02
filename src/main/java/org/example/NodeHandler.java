@@ -1,6 +1,8 @@
 package org.example;
 
 import java.io.IOException;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -109,10 +111,22 @@ public class NodeHandler {
         List<Long> nullableNodes = new ArrayList<>();
         List<Long> movableNodes = new ArrayList<>();
         startingQueue.forEach((key, value) -> {
-            if (value.getStartInstant() == null){
+            if (value.getStartInstant() == null || value.getStartInstant().plusSeconds(15).compareTo(Instant.now()) < 0){
                 nullableNodes.add(key);
-            }else if(value.getStartInstant().plusSeconds(5).compareTo(Instant.now()) < 0){
-                movableNodes.add(key);
+            }else{
+                try {
+                URL url = new URL("http://localhost:" + value.getPort() + "/alive");
+                HttpURLConnection con = (HttpURLConnection) url.openConnection();
+                con.setRequestMethod("GET");
+                con.setConnectTimeout(300);
+                con.setReadTimeout(300);
+                int responseCode = con.getResponseCode();
+                if (responseCode == HttpURLConnection.HTTP_OK){
+                    movableNodes.add(key);
+                }
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
             }
         });
 

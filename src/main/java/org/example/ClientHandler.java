@@ -23,7 +23,10 @@ public class ClientHandler extends SimpleChannelInboundHandler<ByteBuf> {
     @Override
     protected void channelRead0(ChannelHandlerContext ctx, ByteBuf byteBuf) throws Exception {
         System.out.printf("Server received message from node(%d) | ConnectionID: %s\n",node.getNodePId(), ctx.channel().id());
-        clientChannel.writeAndFlush(byteBuf.copy());
+        boolean respond = SimpleCache.storeCache(clientChannel.id().toString(), byteBuf.copy());
+        if(respond){
+            clientChannel.writeAndFlush(byteBuf.copy());
+        }
         System.out.printf("Server forwards message to client | ConnectionID: %s\n", clientChannel.id());
         ctx.channel().close();
     }
